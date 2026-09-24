@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>AR Solitaire</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+
+    <!-- Load A-Frame -->
+    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+    <!-- Load MindAR (Image Tracking) -->
+    <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+
+    <style>
+        :root {
+            /* Felt-table palette: deep green felt, warm cream text, a single
+               gold accent reserved for the win state. Kept deliberately
+               restrained since the camera feed is the real "background". */
+            --felt-dark: #0f2e22;
+            --felt: #1b4332;
+            --cream: #f4f1e8;
+            --gold: #d4af37;
+        }
+
+        html, body {
+            margin: 0;
+            overflow: hidden;
+            height: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        a-scene { position: absolute; inset: 0; }
+
+        /* Everything below sits on top of the camera feed. Only the pieces
+           that must catch taps (the button) enable pointer-events; the rest
+           stays click-through so it never blocks the AR raycaster. */
+        .overlay {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            align-items: center;
+            padding: env(safe-area-inset-top, 18px) 16px env(safe-area-inset-bottom, 18px);
+            box-sizing: border-box;
+        }
+
+        .hint {
+            margin-top: 8px;
+            padding: 8px 16px;
+            border-radius: 999px;
+            background: rgba(15, 46, 34, 0.72);
+            color: var(--cream);
+            font-size: 13px;
+            line-height: 1.4;
+            text-align: center;
+            max-width: 320px;
+        }
+
+        .new-game-btn {
+            pointer-events: auto;
+            margin-bottom: 8px;
+            padding: 12px 28px;
+            border: none;
+            border-radius: 999px;
+            background: var(--felt);
+            color: var(--cream);
+            font-size: 15px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+        }
+        .new-game-btn:active { background: var(--felt-dark); }
+
+        .win-message {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: 20;
+            align-items: center;
+            justify-content: center;
+            background: rgba(15, 46, 34, 0.88);
+            pointer-events: auto;
+        }
+        .win-message .card {
+            text-align: center;
+            color: var(--cream);
+        }
+        .win-message h1 {
+            margin: 0 0 6px;
+            font-size: 30px;
+            color: var(--gold);
+            font-weight: 700;
+        }
+        .win-message p { margin: 0 0 18px; font-size: 14px; opacity: 0.85; }
+        .win-message button {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 999px;
+            background: var(--gold);
+            color: var(--felt-dark);
+            font-weight: 700;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+
+    <a-scene
+        mindar-image="imageTargetSrc: ./targets.mind; filterMinCF:0.0001; filterBeta: 0.001;"
+        color-space="sRGB"
+        renderer="colorManagement: true, physicallyCorrectLights"
+        vr-mode-ui="enabled: false"
+        device-orientation-permission-ui="enabled: false">
+
+        <!-- Tap detection is handled manually in game.js via pointerup +
+             THREE.Raycaster (see setupManualRaycasting). We intentionally do
+             NOT use A-Frame's built-in cursor/raycaster components here:
+             they depend on the browser firing a synthetic "click" after a
+             touch, which MindAR's own touch handling frequently suppresses
+             on mobile, making cards untappable even though everything
+             renders correctly. -->
+        <a-camera position="0 0 0" look-controls="enabled: false"></a-camera>
+
+        <!-- The tracked image target (index 0 = first image in targets.mind).
+             All game geometry lives inside this entity so it inherits the
+             marker's tracked transform automatically. -->
+        <a-entity mindar-image-target="targetIndex: 0">
+
+            <!-- Empty-pile click targets (stock/waste/foundations/tableau),
+                 created once by createPileSlots() in game.js. -->
+            <a-entity id="slotsContainer"></a-entity>
+
+            <!-- All 52 procedurally generated card entities are appended
+                 here by dealNewGame() in game.js. -->
+            <a-entity id="cardsContainer"></a-entity>
+
+        </a-entity>
+    </a-scene>
+
+    <!-- NOTE: model.glb from the original prototype is no longer loaded —
+         cards are now built as textured planes at runtime (see game.js,
+         section 4). If you'd rather render true 3D card meshes instead of
+         flat planes, you can still register model.glb in an <a-assets>
+         block and swap it in inside createCardEntity(). -->
+
+    <div class="overlay">
+        <div class="hint">Tap a card to pick it up, then tap a pile to drop it there. Tap the stock to draw.</div>
+        <button id="newGameBtn" class="new-game-btn" type="button">New Game</button>
+    </div>
+
+    <div id="winMessage" class="win-message">
+        <div class="card">
+            <h1>You Win!</h1>
+            <p>All four foundations are complete.</p>
+            <button type="button" onclick="dealNewGame()">Play Again</button>
+        </div>
+    </div>
+
+    <script src="game.js"></script>
+</body>
+</html>
