@@ -74,9 +74,42 @@
             box-sizing: border-box;
         }
 
+        .tracking-indicator {
+            pointer-events: none;
+            margin-top: 4px;
+            padding: 6px 16px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+            transition: background 0.25s ease, border-color 0.25s ease, color 0.25s ease;
+        }
+        .tracking-ready {
+            background: rgba(16, 68, 44, 0.92);
+            color: #4ade80;
+            border: 1px solid rgba(74, 222, 128, 0.5);
+        }
+        .tracking-ready .tracking-dot {
+            color: #4ade80;
+            font-size: 12px;
+        }
+        .tracking-searching {
+            background: rgba(45, 33, 10, 0.92);
+            color: #facc15;
+            border: 1px solid rgba(250, 204, 21, 0.5);
+        }
+        .tracking-searching .tracking-dot {
+            color: #facc15;
+            font-size: 12px;
+        }
+
         .hint {
             pointer-events: none;
-            margin-top: 8px;
+            margin-top: 6px;
             padding: 8px 16px;
             border-radius: 999px;
             background: rgba(15, 46, 34, 0.72);
@@ -183,6 +216,9 @@
     </div>
 
     <div class="overlay">
+        <div id="trackingIndicator" class="tracking-indicator tracking-searching">
+            <span class="tracking-dot">○</span> <span class="tracking-text">Point camera at the card/target</span>
+        </div>
         <div class="hint">Tap a card to pick it up, then tap a pile to drop it there. Tap the stock to draw.</div>
         <button id="newGameBtn" class="new-game-btn" type="button">New Game</button>
     </div>

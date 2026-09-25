@@ -26,6 +26,7 @@ const CONFIG = {
 // 1. CONSTANTS — dimensions, layout, and AR coordinate space
 // ----------------------------------------------------------------------------
 const BOARD_SCALE = 1.0; // 1:1 target-local coordinate system
+const TEXTURES_REQUIRED = 53; // 52 card faces + 1 card back
 
 const SUITS = ['hearts', 'diamonds', 'clubs', 'spades'];
 const SUIT_SYMBOLS = { hearts: '\u2665', diamonds: '\u2666', clubs: '\u2663', spades: '\u2660' };
@@ -34,20 +35,20 @@ const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
 const RANK_VALUES = RANKS.reduce((map, r, i) => { map[r] = i + 1; return map; }, {});
 
 // Card footprint in target-local units (poker 2.5:3.5 aspect ratio)
-const CARD_WIDTH = 0.110;
-const CARD_HEIGHT = 0.154;
+const CARD_WIDTH = 0.13;
+const CARD_HEIGHT = 0.182;
 
 // Horizontal spacing across 7 tableau columns
-const COL_GAP = 0.115;
+const COL_GAP = 0.145;
 const TABLEAU_X = [-3, -2, -1, 0, 1, 2, 3].map((n) => n * COL_GAP);
 
-// Tableau vertical cascade: clear, generous spacing to ensure readability
-const TABLEAU_TOP_Y = 0.05;
-const TABLEAU_FACEDOWN_STEP = 0.024;
-const TABLEAU_FACEUP_STEP = 0.050;
+// Tableau vertical cascade: strong, distinct spacing so columns never horizontally collapse
+const TABLEAU_TOP_Y = 0.08;
+const TABLEAU_FACEDOWN_STEP = 0.022;
+const TABLEAU_FACEUP_STEP = 0.055;
 
 // Top row: Stock | Waste | (gap) | Foundation x4
-const TOP_ROW_Y = 0.30;
+const TOP_ROW_Y = 0.32;
 const STOCK_POS = { x: TABLEAU_X[0], y: TOP_ROW_Y };
 const WASTE_POS = { x: TABLEAU_X[1], y: TOP_ROW_Y };
 const FOUNDATION_X = [TABLEAU_X[3], TABLEAU_X[4], TABLEAU_X[5], TABLEAU_X[6]];
@@ -61,9 +62,9 @@ const CARD_Z_STEP = 0.008; // 8 mm physical step per card in stack
 const SELECT_LIFT_Y = 0.015;
 const SELECT_LIFT_Z = 0.025;
 
-// Calculated board boundaries: 0.800 m wide (80% of 1.0 target width)
+// Calculated board boundaries: 1.00 m wide, 0.85 m tall (fits comfortably in target area)
 const BOARD_WIDTH = 6 * COL_GAP + CARD_WIDTH;
-const BOARD_HEIGHT = 0.774;
+const BOARD_HEIGHT = 0.85;
 
 // ----------------------------------------------------------------------------
 // 2. GAME STATE & MAPPINGS
@@ -170,7 +171,23 @@ function shuffle(array) {
   return array;
 }
 
+function refreshDebugDisplay() {
+  const faceUpCount = deck.filter((c) => c.faceUp).length;
+  updateDebug({
+    cardMeshes: '52',
+    visibleMeshes: `${faceUpCount} face-up`,
+    texturesReady: `${texturesReadyCount}/53`,
+    board: `${BOARD_WIDTH.toFixed(2)}x${BOARD_HEIGHT.toFixed(2)} (scale: ${BOARD_SCALE})`
+  });
+}
+
 function dealNewGame() {
+  // Ensure all 53 textures are preloaded and validated before dealing
+  if (!validateTextures()) {
+    preloadAllTextures();
+    validateTextures();
+  }
+
   clearBoard();
   selected = null;
   meshToCard.clear();
@@ -201,14 +218,13 @@ function dealNewGame() {
   deck.forEach((card) => container.appendChild(createCardEntity(card)));
   renderBoard(true);
 
+  refreshDebugDisplay();
   updateDebug({
-    cardMeshes: '52',
-    visibleMeshes: `${deck.filter(c => c.faceUp).length} face-up`,
-    texturesReady: `${texturesReadyCount}/53`,
     card: 'DEALT',
     selected: 'NO',
-    board: `${BOARD_WIDTH.toFixed(2)}x${BOARD_HEIGHT.toFixed(2)} (scale: ${BOARD_SCALE})`
   });
+
+  setTimeout(validateAllCards, 50);
 }
 
 function clearBoard() {
@@ -243,7 +259,7 @@ function createCardEntity(card) {
       mesh.material.side = THREE.DoubleSide;
       mesh.material.depthTest = true;
       mesh.material.depthWrite = true;
-      updateCardVisual(card);
+      updateCardTexture(card);
       console.log(`CARD VISUAL READY: card-${card.id}`);
     } else {
       el.addEventListener('loaded', () => {
@@ -255,7 +271,7 @@ function createCardEntity(card) {
           m.material.side = THREE.DoubleSide;
           m.material.depthTest = true;
           m.material.depthWrite = true;
-          updateCardVisual(card);
+          updateCardTexture(card);
           console.log(`CARD VISUAL READY: card-${card.id}`);
         }
       }, { once: true });
@@ -267,26 +283,76 @@ function createCardEntity(card) {
   return el;
 }
 
-function setCardTexture(card, texture) {
+function updateCardTexture(card) {
   if (!card || !card.el) return;
   const mesh = card.el.getObject3D('mesh');
-  if (mesh && mesh.material) {
-    mesh.material.map = texture;
-    mesh.material.color.set(card.selected ? 0xffea75 : 0xffffff);
-    mesh.material.transparent = false;
-    mesh.material.opacity = 1.0;
-    mesh.material.side = THREE.DoubleSide;
-    mesh.material.depthTest = true;
-    mesh.material.depthWrite = true;
-    mesh.material.needsUpdate = true;
+
+  if (!mesh || !mesh.material) {
+    console.warn('Card mesh not ready:', card.id);
+    return;
   }
+
+  const texture = card.faceUp
+    ? getFrontTexture(card)
+    : getBackTexture();
+
+  mesh.material.map = texture;
+  mesh.material.color.set(card.selected ? 0xffea75 : 0xffffff);
+  mesh.material.transparent = false;
+  mesh.material.opacity = 1.0;
+  mesh.material.side = THREE.DoubleSide;
+  mesh.material.depthTest = true;
+  mesh.material.depthWrite = true;
+  mesh.material.needsUpdate = true;
 }
 
-// Swaps texture on the single mesh when faceUp changes (no 180° rotation needed)
+// Alias for backwards-compatibility
 function updateCardVisual(card) {
-  if (!card) return;
-  const texture = card.faceUp ? getFrontTexture(card) : getBackTexture();
-  setCardTexture(card, texture);
+  updateCardTexture(card);
+}
+
+function validateCard(card) {
+  const mesh = card.el ? card.el.getObject3D('mesh') : null;
+
+  if (!mesh) {
+    console.warn('NO MESH:', card.id);
+    return false;
+  }
+
+  if (!mesh.visible) {
+    console.warn('INVISIBLE MESH:', card.id);
+    return false;
+  }
+
+  if (!mesh.material) {
+    console.warn('NO MATERIAL:', card.id);
+    return false;
+  }
+
+  if (!mesh.material.map) {
+    console.warn('NO TEXTURE:', card.id);
+    return false;
+  }
+
+  if (mesh.material.transparent !== false || mesh.material.opacity !== 1 || mesh.material.depthWrite !== true) {
+    console.warn('INVALID MATERIAL PROPERTIES:', card.id, {
+      transparent: mesh.material.transparent,
+      opacity: mesh.material.opacity,
+      depthWrite: mesh.material.depthWrite
+    });
+    return false;
+  }
+
+  return true;
+}
+
+function validateAllCards() {
+  let validCount = 0;
+  deck.forEach((card) => {
+    if (validateCard(card)) validCount++;
+  });
+  console.log(`VALID CARDS: ${validCount}/52`);
+  return validCount === 52;
 }
 
 function setHighlight(card, on) {
@@ -304,6 +370,55 @@ function setHighlight(card, on) {
 // ----------------------------------------------------------------------------
 const frontTextureCache = {};
 let backTextureCache = null;
+
+function preloadAllTextures() {
+  for (const suit of SUITS) {
+    for (const rank of RANKS) {
+      const card = {
+        suit,
+        rank,
+        color: SUIT_COLORS[suit]
+      };
+      getFrontTexture(card);
+    }
+  }
+  getBackTexture();
+  console.log(`PRELOAD ALL TEXTURES: 52 card faces + 1 card back`);
+}
+
+function validateTextures() {
+  let ready = 0;
+
+  for (const suit of SUITS) {
+    for (const rank of RANKS) {
+      const key = `${suit}_${rank}`;
+      const texture = frontTextureCache[key];
+
+      if (
+        texture &&
+        texture.image &&
+        texture.image.width > 0 &&
+        texture.image.height > 0
+      ) {
+        ready++;
+      }
+    }
+  }
+
+  if (
+    backTextureCache &&
+    backTextureCache.image &&
+    backTextureCache.image.width > 0 &&
+    backTextureCache.image.height > 0
+  ) {
+    ready++;
+  }
+
+  texturesReadyCount = ready;
+  console.log(`TEXTURES READY: ${ready}/53`);
+
+  return ready === TEXTURES_REQUIRED;
+}
 
 function getFrontTexture(card) {
   const key = card.suit + '_' + card.rank;
@@ -561,6 +676,8 @@ function renderBoard(instant) {
     const positions = computeTableauPositions(col);
     tableau[col].forEach((card, i) => setCardTransform(card, positions[i], instant));
   }
+
+  refreshDebugDisplay();
 }
 
 function setCardTransform(card, pos, instant) {
@@ -834,8 +951,9 @@ function checkAutoFlipTableauTop(pile) {
   const top = arr[arr.length - 1];
   if (!top.faceUp) {
     top.faceUp = true;
-    updateCardVisual(top);
+    updateCardTexture(top);
     renderBoard(false);
+    console.log(`AUTO-FLIP: Revealed ${top.rank}${SUIT_SYMBOLS[top.suit]} at tableau[${pile.index}]`);
   }
 }
 
@@ -852,6 +970,7 @@ function drawFromStock() {
       c.faceUp = false;
       c.location = { type: 'stock' };
       stock.push(c);
+      updateCardTexture(c);
     }
     renderBoard(false);
     console.log('STOCK: Recycled waste to stock');
@@ -862,6 +981,7 @@ function drawFromStock() {
   card.faceUp = true;
   card.location = { type: 'waste' };
   waste.push(card);
+  updateCardTexture(card);
   renderBoard(false);
   const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
   console.log(`STOCK: Drew ${cardStr}`);
@@ -890,16 +1010,17 @@ let tapStartTime = 0;
 function getInteractiveMeshes() {
   const meshes = [];
 
-  // Active pile slots
+  // Active pile slots: ONLY interactive when the pile is empty!
   pileSlots.forEach((slotData) => {
     const mesh = slotData.el ? slotData.el.getObject3D('mesh') : null;
     if (!mesh) return;
 
     let isTargetable = false;
     if (slotData.type === 'stock') {
-      isTargetable = true; // Always targetable to draw or recycle
+      // Stock slot is ONLY targetable to recycle when stock has 0 cards!
+      isTargetable = stock.length === 0;
     } else if (slotData.type === 'waste') {
-      isTargetable = waste.length === 0;
+      isTargetable = false;
     } else if (slotData.type === 'tableau') {
       isTargetable = tableau[slotData.index] && tableau[slotData.index].length === 0;
     } else if (slotData.type === 'foundation') {
@@ -963,7 +1084,19 @@ function performRaycast(clientX, clientY) {
     return;
   }
 
-  // Sorted by distance: hits[0] is physically closest top-most card
+  // If multiple hits occur (e.g. cascaded cards in tableau overlapping):
+  // Resolve topmost visual card by sorting primarily by distance from camera,
+  // and breaking ties / near-ties (within 5mm) by renderOrder descending.
+  hits.sort((a, b) => {
+    const distDiff = a.distance - b.distance;
+    const renderOrderA = a.object.renderOrder || 0;
+    const renderOrderB = b.object.renderOrder || 0;
+    if (Math.abs(distDiff) < 0.005) {
+      return renderOrderB - renderOrderA;
+    }
+    return distDiff;
+  });
+
   const hitMesh = hits[0].object;
   const card = meshToCard.get(hitMesh.uuid);
   const slot = meshToSlot.get(hitMesh.uuid);
@@ -1087,15 +1220,34 @@ function setupManualRaycasting() {
     }, 200);
   });
 
+  function setTrackingState(isTracking) {
+    const indicator = document.getElementById('trackingIndicator');
+    if (indicator) {
+      if (isTracking) {
+        indicator.className = 'tracking-indicator tracking-ready';
+        indicator.innerHTML = '<span class="tracking-dot">●</span> <span class="tracking-text">AR Ready</span>';
+      } else {
+        indicator.className = 'tracking-indicator tracking-searching';
+        indicator.innerHTML = '<span class="tracking-dot">○</span> <span class="tracking-text">Point camera at the card/target</span>';
+      }
+    }
+
+    updateDebug({
+      tracking: isTracking
+        ? '<span class="status-tracking">TRACKING</span>'
+        : '<span class="status-searching">SEARCHING</span>'
+    });
+  }
+
   const targetEl = document.querySelector('[mindar-image-target]');
   if (targetEl) {
     targetEl.addEventListener('targetFound', () => {
       console.log('AR: Target Found');
-      updateDebug({ tracking: '<span class="status-tracking">TRACKING</span>' });
+      setTrackingState(true);
     });
     targetEl.addEventListener('targetLost', () => {
       console.log('AR: Target Lost');
-      updateDebug({ tracking: '<span class="status-searching">SEARCHING</span>' });
+      setTrackingState(false);
     });
   }
 }
@@ -1191,7 +1343,21 @@ function init() {
   const newGameBtn = document.getElementById('newGameBtn');
   if (newGameBtn) newGameBtn.addEventListener('click', dealNewGame);
   window.dealNewGame = dealNewGame;
+
+  // 1. Preload all 53 textures (52 card faces + 1 card back) upfront
+  preloadAllTextures();
+
+  // 2. Validate all 53 textures before dealing
+  const texturesOk = validateTextures();
+  if (!texturesOk) {
+    console.error(`Preloaded textures count mismatch: ${texturesReadyCount}/${TEXTURES_REQUIRED}`);
+  }
+
+  // 3. Deal initial game (creates card meshes, attaches textures, renders board)
   dealNewGame();
+
+  // 4. Validate cards
+  setTimeout(validateAllCards, 50);
 }
 
 const sceneEl = document.querySelector('a-scene');
