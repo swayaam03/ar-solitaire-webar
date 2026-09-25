@@ -1,22 +1,20 @@
 /* ============================================================================
    AR KLONDIKE SOLITAIRE — game.js
    ============================================================================
-   Architecture:
-   1. CARD MODEL     — Plain JS objects {suit, rank, rankValue, color, faceUp,
-                         location, el, frontEl, backEl, hitEl, isInteractive}.
-   2. 3D CARDS       — Wrapper entity containing front plane, back plane, and
-                         a transparent interaction hitbox.
-   3. MESH MAPPING   — Robust mesh.uuid -> card / slot Maps for instant,
-                         unambiguous resolution without fragile DOM traversal.
-   4. INTERACTION    — Coordinated touch / pointer pipeline with tap validation,
-                         debounce, and interaction locks to prevent ghost clicks.
-   5. COORDINATES    — Strict NDC calculation against the actual A-Frame canvas.
+   Single-Mesh Card Architecture:
+   - Exactly ONE <a-plane> entity per card with THREE.DoubleSide material.
+   - Textures swap dynamically on that single mesh when card.faceUp changes.
+   - No two-plane wrappers, no 180° rotations, no Z-fighting or plane bleeding.
+   - Elevation base BOARD_Z = 0.015 ensures cards never clip into the target image.
+   - CARD_Z_STEP = 0.008 with mesh.renderOrder = layer + 1 for deterministic stacking.
+   - Direct mesh.uuid -> card / slot Maps for instant, unambiguous raycasting.
    ========================================================================== */
 
 // ----------------------------------------------------------------------------
 // 0. CONFIG & DEBUG
 // ----------------------------------------------------------------------------
-const DEBUG_AR = true; // Enables real-time diagnostics overlay on phone
+const DEBUG_AR = true;     // Real-time diagnostics overlay for physical phone testing
+const DEBUG_BOARD = false;  // Toggle to true to render the gold board bounding box
 
 const CONFIG = {
   useImageTextures: false,
@@ -25,9 +23,9 @@ const CONFIG = {
 };
 
 // ----------------------------------------------------------------------------
-// 1. CONSTANTS — suits, ranks, and the 3D table layout
+// 1. CONSTANTS — dimensions, layout, and AR coordinate space
 // ----------------------------------------------------------------------------
-const BOARD_SCALE = 0.72; // Global scale applied to #gameBoard
+const BOARD_SCALE = 1.0; // 1:1 target-local coordinate system
 
 const SUITS = ['hearts', 'diamonds', 'clubs', 'spades'];
 const SUIT_SYMBOLS = { hearts: '\u2665', diamonds: '\u2666', clubs: '\u2663', spades: '\u2660' };
@@ -35,33 +33,37 @@ const SUIT_COLORS = { hearts: 'red', diamonds: 'red', clubs: 'black', spades: 'b
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 const RANK_VALUES = RANKS.reduce((map, r, i) => { map[r] = i + 1; return map; }, {});
 
-// Card footprint, in target-local units. Standard poker card ~2.5:3.5.
-const CARD_WIDTH = 0.11;
+// Card footprint in target-local units (poker 2.5:3.5 aspect ratio)
+const CARD_WIDTH = 0.110;
 const CARD_HEIGHT = 0.154;
 
-// Horizontal spacing between the 7 tableau columns / top-row piles.
+// Horizontal spacing across 7 tableau columns
 const COL_GAP = 0.115;
 const TABLEAU_X = [-3, -2, -1, 0, 1, 2, 3].map((n) => n * COL_GAP);
 
-// Vertical cascade: how far down (in Y) each successive tableau card sits.
-const TABLEAU_TOP_Y = -0.02;
-const TABLEAU_FACEDOWN_STEP = 0.018;
-const TABLEAU_FACEUP_STEP = 0.040;
+// Tableau vertical cascade: clear, generous spacing to ensure readability
+const TABLEAU_TOP_Y = 0.05;
+const TABLEAU_FACEDOWN_STEP = 0.024;
+const TABLEAU_FACEUP_STEP = 0.050;
 
 // Top row: Stock | Waste | (gap) | Foundation x4
-const TOP_ROW_Y = 0.28;
+const TOP_ROW_Y = 0.30;
 const STOCK_POS = { x: TABLEAU_X[0], y: TOP_ROW_Y };
 const WASTE_POS = { x: TABLEAU_X[1], y: TOP_ROW_Y };
 const FOUNDATION_X = [TABLEAU_X[3], TABLEAU_X[4], TABLEAU_X[5], TABLEAU_X[6]];
 const FOUNDATION_Y = TOP_ROW_Y;
 
-// Stable Z-depth ordering
-const CARD_Z_STEP = 0.006;
-const PLANE_Z_OFFSET = 0.0015;
+// AR depth relative to target surface
+const BOARD_Z = 0.015;     // 1.5 cm above marker plane: eliminates target clipping
+const CARD_Z_STEP = 0.008; // 8 mm physical step per card in stack
 
 // Selection lift
 const SELECT_LIFT_Y = 0.015;
 const SELECT_LIFT_Z = 0.025;
+
+// Calculated board boundaries: 0.800 m wide (80% of 1.0 target width)
+const BOARD_WIDTH = 6 * COL_GAP + CARD_WIDTH;
+const BOARD_HEIGHT = 0.774;
 
 // ----------------------------------------------------------------------------
 // 2. GAME STATE & MAPPINGS
@@ -72,13 +74,13 @@ let stock = [];
 let waste = [];
 let foundations = { hearts: [], diamonds: [], clubs: [], spades: [] };
 
-// The current selection: { card, pile, run }
 let selected = null;
 
-// Direct mapping from Three.js mesh.uuid -> Card or Pile Slot
+// Direct mapping from Three.js mesh.uuid -> Card object or Pile Slot
 const meshToCard = new Map();
 const meshToSlot = new Map();
 const pileSlots = [];
+let texturesReadyCount = 0;
 
 // ----------------------------------------------------------------------------
 // 3. DEBUG OVERLAY HELPER
@@ -94,6 +96,18 @@ function updateDebug(data) {
     const el = document.getElementById('debugTracking');
     if (el) el.innerHTML = data.tracking;
   }
+  if (data.cardMeshes !== undefined) {
+    const el = document.getElementById('debugCardMeshes');
+    if (el) el.textContent = data.cardMeshes;
+  }
+  if (data.visibleMeshes !== undefined) {
+    const el = document.getElementById('debugVisibleMeshes');
+    if (el) el.textContent = data.visibleMeshes;
+  }
+  if (data.texturesReady !== undefined) {
+    const el = document.getElementById('debugTexturesReady');
+    if (el) el.textContent = data.texturesReady;
+  }
   if (data.pointer !== undefined) {
     const el = document.getElementById('debugPointer');
     if (el) el.textContent = data.pointer;
@@ -106,9 +120,9 @@ function updateDebug(data) {
     const el = document.getElementById('debugHits');
     if (el) el.textContent = data.hits;
   }
-  if (data.hitType !== undefined) {
-    const el = document.getElementById('debugHitType');
-    if (el) el.textContent = data.hitType;
+  if (data.hitObject !== undefined) {
+    const el = document.getElementById('debugHitObject');
+    if (el) el.textContent = data.hitObject;
   }
   if (data.card !== undefined) {
     const el = document.getElementById('debugCard');
@@ -118,9 +132,9 @@ function updateDebug(data) {
     const el = document.getElementById('debugSelected');
     if (el) el.textContent = data.selected;
   }
-  if (data.action !== undefined) {
-    const el = document.getElementById('debugAction');
-    if (el) el.textContent = data.action;
+  if (data.board !== undefined) {
+    const el = document.getElementById('debugBoard');
+    if (el) el.textContent = data.board;
   }
 }
 
@@ -140,11 +154,8 @@ function buildDeck() {
         color: SUIT_COLORS[suit],
         faceUp: false,
         location: null,
-        el: null,
-        frontEl: null,
-        backEl: null,
-        hitEl: null,
-        isInteractive: false,
+        el: null, // Single <a-plane>
+        selected: false,
       });
     }
   }
@@ -191,9 +202,12 @@ function dealNewGame() {
   renderBoard(true);
 
   updateDebug({
+    cardMeshes: '52',
+    visibleMeshes: `${deck.filter(c => c.faceUp).length} face-up`,
+    texturesReady: `${texturesReadyCount}/53`,
     card: 'DEALT',
     selected: 'NO',
-    action: 'New Game Started'
+    board: `${BOARD_WIDTH.toFixed(2)}x${BOARD_HEIGHT.toFixed(2)} (scale: ${BOARD_SCALE})`
   });
 }
 
@@ -207,110 +221,86 @@ function clearBoard() {
 }
 
 // ----------------------------------------------------------------------------
-// 5. 3D CARD ENTITY CREATION & INTERACTION COLLIDERS
+// 5. SINGLE-MESH CARD ENTITY CREATION & VISUAL UPDATING
 // ----------------------------------------------------------------------------
 function createCardEntity(card) {
-  const wrapper = document.createElement('a-entity');
-  wrapper.id = 'card-' + card.id;
-  wrapper.classList.add('card-wrapper');
-  wrapper.dataset.cardId = card.id;
+  // Exactly ONE <a-plane> per card. No wrappers, no front/back plane offsets.
+  const el = document.createElement('a-plane');
+  el.id = 'card-' + card.id;
+  el.classList.add('card-plane');
+  el.setAttribute('width', CARD_WIDTH);
+  el.setAttribute('height', CARD_HEIGHT);
+  el.setAttribute('position', `0 0 ${BOARD_Z}`);
+  el.setAttribute('rotation', '0 0 0');
+  el.setAttribute('material', 'shader: flat; side: double; transparent: false; opacity: 1');
 
-  // Front plane (visible when faceUp)
-  const front = document.createElement('a-plane');
-  front.classList.add('card-front');
-  front.setAttribute('width', CARD_WIDTH);
-  front.setAttribute('height', CARD_HEIGHT);
-  front.setAttribute('position', `0 0 ${PLANE_Z_OFFSET}`);
-  front.setAttribute('visible', card.faceUp);
-  front.setAttribute('material', 'shader: flat; side: front');
-
-  // Back plane (visible when !faceUp)
-  const back = document.createElement('a-plane');
-  back.classList.add('card-back');
-  back.setAttribute('width', CARD_WIDTH);
-  back.setAttribute('height', CARD_HEIGHT);
-  back.setAttribute('rotation', '0 180 0');
-  back.setAttribute('position', `0 0 ${-PLANE_Z_OFFSET}`);
-  back.setAttribute('visible', !card.faceUp);
-  back.setAttribute('material', 'shader: flat; side: front; color: #8B0000');
-
-  // Dedicated transparent interaction hitbox covering full card surface
-  const hit = document.createElement('a-plane');
-  hit.classList.add('card-hitbox');
-  hit.setAttribute('width', (CARD_WIDTH * 1.08).toFixed(4));
-  hit.setAttribute('height', (CARD_HEIGHT * 1.08).toFixed(4));
-  hit.setAttribute('position', `0 0 ${PLANE_Z_OFFSET + 0.001}`);
-  hit.setAttribute('material', 'shader: flat; transparent: true; opacity: 0.001; depthWrite: false; side: double');
-  hit.setAttribute('visible', card.faceUp || (card.location && card.location.type === 'stock'));
-
-  wrapper.appendChild(front);
-  wrapper.appendChild(back);
-  wrapper.appendChild(hit);
-
-  // Register in meshToCard map for instant O(1) resolution on raycast hits
-  function registerMesh(el) {
+  function initMesh() {
     const mesh = el.getObject3D('mesh');
     if (mesh) {
       meshToCard.set(mesh.uuid, card);
+      mesh.material.transparent = false;
+      mesh.material.opacity = 1.0;
+      mesh.material.side = THREE.DoubleSide;
+      mesh.material.depthTest = true;
+      mesh.material.depthWrite = true;
+      updateCardVisual(card);
+      console.log(`CARD VISUAL READY: card-${card.id}`);
     } else {
       el.addEventListener('loaded', () => {
         const m = el.getObject3D('mesh');
-        if (m) meshToCard.set(m.uuid, card);
+        if (m) {
+          meshToCard.set(m.uuid, card);
+          m.material.transparent = false;
+          m.material.opacity = 1.0;
+          m.material.side = THREE.DoubleSide;
+          m.material.depthTest = true;
+          m.material.depthWrite = true;
+          updateCardVisual(card);
+          console.log(`CARD VISUAL READY: card-${card.id}`);
+        }
       }, { once: true });
     }
   }
+  initMesh();
 
-  registerMesh(front);
-  registerMesh(back);
-  registerMesh(hit);
-
-  // Apply textures
-  front.addEventListener('loaded', () => applyTexture(front, getFrontTexture(card)));
-  back.addEventListener('loaded', () => applyTexture(back, getBackTexture()));
-
-  card.el = wrapper;
-  card.frontEl = front;
-  card.backEl = back;
-  card.hitEl = hit;
-  return wrapper;
+  card.el = el;
+  return el;
 }
 
-function updateCardInteraction(card) {
+function setCardTexture(card, texture) {
   if (!card || !card.el) return;
-  const isStock = card.location && card.location.type === 'stock';
-  card.isInteractive = card.faceUp || isStock;
-
-  if (card.frontEl) card.frontEl.setAttribute('visible', card.faceUp);
-  if (card.backEl) card.backEl.setAttribute('visible', !card.faceUp);
-  if (card.hitEl) card.hitEl.setAttribute('visible', card.isInteractive);
-}
-
-function applyTexture(planeEl, texture) {
-  const mesh = planeEl.getObject3D('mesh');
+  const mesh = card.el.getObject3D('mesh');
   if (mesh && mesh.material) {
     mesh.material.map = texture;
-    mesh.material.color.set(0xffffff);
+    mesh.material.color.set(card.selected ? 0xffea75 : 0xffffff);
+    mesh.material.transparent = false;
+    mesh.material.opacity = 1.0;
+    mesh.material.side = THREE.DoubleSide;
     mesh.material.depthTest = true;
     mesh.material.depthWrite = true;
     mesh.material.needsUpdate = true;
-  } else {
-    setTimeout(() => applyTexture(planeEl, texture), 50);
   }
 }
 
+// Swaps texture on the single mesh when faceUp changes (no 180° rotation needed)
+function updateCardVisual(card) {
+  if (!card) return;
+  const texture = card.faceUp ? getFrontTexture(card) : getBackTexture();
+  setCardTexture(card, texture);
+}
+
 function setHighlight(card, on) {
-  [card.frontEl, card.backEl].forEach((el) => {
-    if (!el) return;
-    const mesh = el.getObject3D('mesh');
-    if (mesh && mesh.material) {
-      mesh.material.color.set(on ? 0xffd54f : 0xffffff);
-      mesh.material.needsUpdate = true;
-    }
-  });
+  card.selected = on;
+  if (!card.el) return;
+  const mesh = card.el.getObject3D('mesh');
+  if (mesh && mesh.material) {
+    mesh.material.color.set(on ? 0xffea75 : 0xffffff);
+    mesh.material.needsUpdate = true;
+  }
 }
 
 // ----------------------------------------------------------------------------
-// 6. TEXTURE GENERATION
+// 6. HIGH-CONTRAST OPAQUE TEXTURES (WHITE CARD FACES / CRIMSON BACK)
 // ----------------------------------------------------------------------------
 const frontTextureCache = {};
 let backTextureCache = null;
@@ -349,41 +339,54 @@ function generatePlaceholderFrontTexture(card) {
   canvas.width = 256;
   canvas.height = 358;
   const ctx = canvas.getContext('2d');
-  const color = card.color === 'red' ? '#c81e1e' : '#111111';
+  const color = card.color === 'red' ? '#c81010' : '#0a0a0a';
 
-  ctx.fillStyle = '#fbfbf7';
-  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 20, true, false);
-  ctx.strokeStyle = '#333333';
-  ctx.lineWidth = 3;
-  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 20, false, true);
+  // Solid pure white background
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Outer dark solid border
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 4;
+  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 18, false, true);
+
+  // Inner subtle border
+  ctx.strokeStyle = '#e0e0e0';
+  ctx.lineWidth = 1;
+  roundRect(ctx, 8, 8, canvas.width - 16, canvas.height - 16, 14, false, true);
 
   ctx.fillStyle = color;
   ctx.textBaseline = 'top';
 
   // Top-left rank + suit
-  ctx.font = 'bold 42px Georgia, serif';
+  ctx.font = 'bold 44px Georgia, serif';
   ctx.fillText(card.rank, 16, 12);
-  ctx.font = '34px Georgia, serif';
-  ctx.fillText(SUIT_SYMBOLS[card.suit], 16, 58);
+  ctx.font = '36px Georgia, serif';
+  ctx.fillText(SUIT_SYMBOLS[card.suit], 16, 60);
 
   // Bottom-right rank + suit
   ctx.save();
   ctx.translate(canvas.width - 16, canvas.height - 12);
   ctx.rotate(Math.PI);
-  ctx.font = 'bold 42px Georgia, serif';
+  ctx.font = 'bold 44px Georgia, serif';
   ctx.fillText(card.rank, 0, 0);
-  ctx.font = '34px Georgia, serif';
-  ctx.fillText(SUIT_SYMBOLS[card.suit], 0, 46);
+  ctx.font = '36px Georgia, serif';
+  ctx.fillText(SUIT_SYMBOLS[card.suit], 0, 48);
   ctx.restore();
 
-  // Centre suit symbol
-  ctx.font = '130px Georgia, serif';
+  // Centre big suit symbol
+  ctx.font = '136px Georgia, serif';
   ctx.textAlign = 'center';
-  ctx.fillText(SUIT_SYMBOLS[card.suit], canvas.width / 2, canvas.height / 2 - 65);
+  ctx.fillText(SUIT_SYMBOLS[card.suit], canvas.width / 2, canvas.height / 2 - 68);
   ctx.textAlign = 'left';
 
   const texture = new THREE.CanvasTexture(canvas);
+  if (THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
   texture.needsUpdate = true;
+  texturesReadyCount++;
+  console.log(`TEXTURE READY: ${card.rank}${card.suit.charAt(0).toUpperCase()}`);
   return texture;
 }
 
@@ -393,15 +396,24 @@ function generatePlaceholderBackTexture() {
   canvas.height = 358;
   const ctx = canvas.getContext('2d');
 
-  ctx.fillStyle = '#7a1414';
-  roundRect(ctx, 0, 0, canvas.width, canvas.height, 20, true, false);
-  ctx.strokeStyle = '#f4f1e8';
-  ctx.lineWidth = 6;
-  roundRect(ctx, 14, 14, canvas.width - 28, canvas.height - 28, 14, false, true);
+  // Solid crimson/burgundy background
+  ctx.fillStyle = '#7a1113';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  ctx.strokeStyle = 'rgba(244,241,232,0.35)';
+  // Gold outer border
+  ctx.strokeStyle = '#d4af37';
+  ctx.lineWidth = 5;
+  roundRect(ctx, 6, 6, canvas.width - 12, canvas.height - 12, 16, false, true);
+
+  // Cream inner border
+  ctx.strokeStyle = '#f4f1e8';
   ctx.lineWidth = 2;
-  for (let i = -canvas.height; i < canvas.width; i += 16) {
+  roundRect(ctx, 14, 14, canvas.width - 28, canvas.height - 28, 12, false, true);
+
+  // Diamond lattice pattern
+  ctx.strokeStyle = 'rgba(244, 241, 232, 0.4)';
+  ctx.lineWidth = 2;
+  for (let i = -canvas.height; i < canvas.width; i += 18) {
     ctx.beginPath();
     ctx.moveTo(i, 0);
     ctx.lineTo(i + canvas.height, canvas.height);
@@ -413,7 +425,12 @@ function generatePlaceholderBackTexture() {
   }
 
   const texture = new THREE.CanvasTexture(canvas);
+  if (THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
   texture.needsUpdate = true;
+  texturesReadyCount++;
+  console.log('TEXTURE READY: BACK');
   return texture;
 }
 
@@ -434,8 +451,22 @@ function roundRect(ctx, x, y, w, h, r, fill, stroke) {
 }
 
 // ----------------------------------------------------------------------------
-// 7. PILE SLOTS — Click targets for empty piles
+// 7. PILE SLOTS & BOARD BOUNDS
 // ----------------------------------------------------------------------------
+function createBoardBounds(container) {
+  if (!DEBUG_BOARD) return;
+  const existing = document.getElementById('debugBoardBounds');
+  if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+
+  const box = document.createElement('a-plane');
+  box.id = 'debugBoardBounds';
+  box.setAttribute('width', BOARD_WIDTH);
+  box.setAttribute('height', BOARD_HEIGHT);
+  box.setAttribute('position', `0 -0.01 0.002`);
+  box.setAttribute('material', 'shader: flat; color: #d4af37; wireframe: true; opacity: 0.8; transparent: true');
+  container.appendChild(box);
+}
+
 function createPileSlots() {
   const container = document.getElementById('slotsContainer');
   if (!container) return;
@@ -447,6 +478,8 @@ function createPileSlots() {
   addSlot(container, 'waste', null, WASTE_POS.x, WASTE_POS.y);
   SUITS.forEach((suit, i) => addSlot(container, 'foundation', suit, FOUNDATION_X[i], FOUNDATION_Y));
   for (let c = 0; c < 7; c++) addSlot(container, 'tableau', c, TABLEAU_X[c], TABLEAU_TOP_Y);
+
+  createBoardBounds(container);
 }
 
 function addSlot(container, type, id, x, y) {
@@ -456,10 +489,11 @@ function addSlot(container, type, id, x, y) {
   if (id !== null && id !== undefined) {
     el.dataset.pileId = id;
   }
-  el.setAttribute('width', (CARD_WIDTH * 1.06).toFixed(4));
-  el.setAttribute('height', (CARD_HEIGHT * 1.06).toFixed(4));
-  el.setAttribute('position', `${x} ${y} -0.005`);
-  el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.15; transparent: true; side: double');
+  el.setAttribute('width', CARD_WIDTH);
+  el.setAttribute('height', CARD_HEIGHT);
+  el.setAttribute('position', `${x} ${y} ${BOARD_Z - 0.004}`);
+  el.setAttribute('rotation', '0 0 0');
+  el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.20; transparent: true; side: double');
 
   const slotData = type === 'foundation'
     ? { type: 'foundation', suit: id, index: id, el }
@@ -470,11 +504,15 @@ function addSlot(container, type, id, x, y) {
   function registerSlotMesh() {
     const mesh = el.getObject3D('mesh');
     if (mesh) {
+      mesh.renderOrder = 0;
       meshToSlot.set(mesh.uuid, slotData);
     } else {
       el.addEventListener('loaded', () => {
         const m = el.getObject3D('mesh');
-        if (m) meshToSlot.set(m.uuid, slotData);
+        if (m) {
+          m.renderOrder = 0;
+          meshToSlot.set(m.uuid, slotData);
+        }
       }, { once: true });
     }
   }
@@ -484,14 +522,19 @@ function addSlot(container, type, id, x, y) {
 }
 
 // ----------------------------------------------------------------------------
-// 8. LAYOUT / RENDERING
+// 8. LAYOUT / RENDERING WITH Z-DEPTH & RENDERORDER
 // ----------------------------------------------------------------------------
 function computeTableauPositions(col) {
   const positions = [];
   let y = TABLEAU_TOP_Y;
   const pile = tableau[col];
   for (let i = 0; i < pile.length; i++) {
-    positions.push({ x: TABLEAU_X[col], y, z: i * CARD_Z_STEP });
+    positions.push({
+      x: TABLEAU_X[col],
+      y,
+      z: BOARD_Z + i * CARD_Z_STEP,
+      layer: i,
+    });
     y -= pile[i].faceUp ? TABLEAU_FACEUP_STEP : TABLEAU_FACEDOWN_STEP;
   }
   return positions;
@@ -499,64 +542,45 @@ function computeTableauPositions(col) {
 
 function renderBoard(instant) {
   stock.forEach((card, i) => {
-    setCardTransform(card, { x: STOCK_POS.x, y: STOCK_POS.y, z: i * CARD_Z_STEP }, false, instant);
+    setCardTransform(card, { x: STOCK_POS.x, y: STOCK_POS.y, z: BOARD_Z + i * CARD_Z_STEP, layer: i }, instant);
   });
 
   waste.forEach((card, i) => {
     const fromTop = waste.length - 1 - i;
-    const fan = fromTop < 3 ? (2 - fromTop) * 0.016 : 0;
-    setCardTransform(card, { x: WASTE_POS.x + fan, y: WASTE_POS.y, z: i * CARD_Z_STEP }, true, instant);
+    const fan = fromTop < 3 ? (2 - fromTop) * 0.018 : 0;
+    setCardTransform(card, { x: WASTE_POS.x + fan, y: WASTE_POS.y, z: BOARD_Z + i * CARD_Z_STEP, layer: i }, instant);
   });
 
   SUITS.forEach((suit, fi) => {
     foundations[suit].forEach((card, i) => {
-      setCardTransform(card, { x: FOUNDATION_X[fi], y: FOUNDATION_Y, z: i * CARD_Z_STEP }, true, instant);
+      setCardTransform(card, { x: FOUNDATION_X[fi], y: FOUNDATION_Y, z: BOARD_Z + i * CARD_Z_STEP, layer: i }, instant);
     });
   });
 
   for (let col = 0; col < 7; col++) {
     const positions = computeTableauPositions(col);
-    tableau[col].forEach((card, i) => setCardTransform(card, positions[i], card.faceUp, instant));
+    tableau[col].forEach((card, i) => setCardTransform(card, positions[i], instant));
   }
 }
 
-function applyDepthBias(card, layer) {
-  [card.frontEl, card.backEl].forEach((el) => {
-    if (!el) return;
-    const mesh = el.getObject3D('mesh');
-    if (mesh && mesh.material) {
-      mesh.material.depthTest = true;
-      mesh.material.depthWrite = true;
-      mesh.material.polygonOffset = true;
-      mesh.material.polygonOffsetFactor = -0.5;
-      mesh.material.polygonOffsetUnits = -1;
-    }
-  });
-}
-
-function setCardTransform(card, pos, faceUp, instant) {
+function setCardTransform(card, pos, instant) {
   const el = card.el;
   if (!el) return;
-  const targetRotation = faceUp ? '0 0 0' : '0 180 0';
 
-  updateCardInteraction(card);
-  applyDepthBias(card, Math.round(pos.z / CARD_Z_STEP));
+  updateCardVisual(card);
+
+  const mesh = el.getObject3D('mesh');
+  if (mesh) {
+    mesh.renderOrder = (pos.layer !== undefined ? pos.layer : 0) + 1;
+  }
 
   if (instant) {
     el.removeAttribute('animation__move');
-    el.removeAttribute('animation__flip');
     el.removeAttribute('animation__lift');
     el.setAttribute('position', `${pos.x} ${pos.y} ${pos.z}`);
-    el.setAttribute('rotation', targetRotation);
+    el.setAttribute('rotation', '0 0 0');
   } else {
-    // Keep both faces visible during 3D flip animation
-    if (card.frontEl) card.frontEl.setAttribute('visible', true);
-    if (card.backEl) card.backEl.setAttribute('visible', true);
-    el.setAttribute('animation__move', `property: position; to: ${pos.x} ${pos.y} ${pos.z}; dur: 350; easing: easeOutQuad`);
-    el.setAttribute('animation__flip', `property: rotation; to: ${targetRotation}; dur: 300; easing: easeInOutQuad`);
-    setTimeout(() => {
-      updateCardInteraction(card);
-    }, 320);
+    el.setAttribute('animation__move', `property: position; to: ${pos.x} ${pos.y} ${pos.z}; dur: 320; easing: easeOutQuad`);
   }
 }
 
@@ -621,7 +645,9 @@ function canPlaceOnFoundation(card, suit) {
 function selectCard(card, pile) {
   const run = pile.type === 'tableau' ? getRunFrom(pile.index, card) : [card];
   selected = { card, pile, run };
-  run.forEach((c) => {
+
+  run.forEach((c, idx) => {
+    c.selected = true;
     const el = c.el;
     let pos = el.getAttribute('position');
     if (typeof pos === 'string') {
@@ -632,12 +658,20 @@ function selectCard(card, pile) {
     } else if (!pos) {
       pos = { x: 0, y: 0, z: 0 };
     }
+
     el.dataset.origX = pos.x;
     el.dataset.origY = pos.y;
     el.dataset.origZ = pos.z;
+
     const targetY = (parseFloat(pos.y) + SELECT_LIFT_Y).toFixed(4);
     const targetZ = (parseFloat(pos.z) + SELECT_LIFT_Z).toFixed(4);
-    el.setAttribute('animation__lift', `property: position; to: ${pos.x} ${targetY} ${targetZ}; dur: 150; easing: easeOutQuad`);
+
+    const mesh = el.getObject3D('mesh');
+    if (mesh) {
+      mesh.renderOrder = 200 + idx;
+    }
+
+    el.setAttribute('animation__lift', `property: position; to: ${pos.x} ${targetY} ${targetZ}; dur: 140; easing: easeOutQuad`);
     setHighlight(c, true);
   });
 
@@ -647,36 +681,39 @@ function selectCard(card, pile) {
   console.log(`SOURCE: ${pileStr}`);
   updateDebug({
     selected: `YES (${cardStr})`,
-    action: `Selected ${cardStr} from ${pileStr}`
   });
 }
 
 function deselectCard() {
   if (!selected) return;
   const cardStr = `${selected.card.rank}${SUIT_SYMBOLS[selected.card.suit]}`;
+
   selected.run.forEach((c) => {
+    c.selected = false;
     const el = c.el;
     const origX = el.dataset.origX;
     const origY = el.dataset.origY;
     const origZ = el.dataset.origZ;
     if (origY !== undefined && origZ !== undefined) {
-      el.setAttribute('animation__lift', `property: position; to: ${origX} ${origY} ${origZ}; dur: 150; easing: easeOutQuad`);
+      el.setAttribute('animation__lift', `property: position; to: ${origX} ${origY} ${origZ}; dur: 140; easing: easeOutQuad`);
       setTimeout(() => {
         el.removeAttribute('animation__lift');
-      }, 160);
+      }, 150);
     }
     setHighlight(c, false);
   });
+
+  renderBoard(true); // Re-assigns clean layer renderOrders
   selected = null;
   console.log(`DESELECTED: ${cardStr}`);
   updateDebug({
     selected: 'NO',
-    action: `Deselected ${cardStr}`
   });
 }
 
 function clearSelectionForMove(run) {
   run.forEach((c) => {
+    c.selected = false;
     c.el.removeAttribute('animation__lift');
     setHighlight(c, false);
   });
@@ -695,7 +732,7 @@ function onCardClicked(card) {
     return;
   }
 
-  // Face-down tableau cards cannot be selected or targeted
+  // Face-down cards in tableau cannot be selected or targeted
   if (!card.faceUp) return;
 
   if (!selected) {
@@ -766,16 +803,8 @@ function attemptMove(sel, destPile) {
     selected = null;
     checkAutoFlipTableauTop(srcPile);
     checkWinCondition();
-    updateDebug({
-      selected: 'NO',
-      action: `Moved ${cardStr} to ${destStr}`
-    });
   } else {
     deselectCard();
-    updateDebug({
-      selected: 'NO',
-      action: `Invalid move: ${cardStr} to ${destStr}`
-    });
   }
 }
 
@@ -805,6 +834,7 @@ function checkAutoFlipTableauTop(pile) {
   const top = arr[arr.length - 1];
   if (!top.faceUp) {
     top.faceUp = true;
+    updateCardVisual(top);
     renderBoard(false);
   }
 }
@@ -825,7 +855,6 @@ function drawFromStock() {
     }
     renderBoard(false);
     console.log('STOCK: Recycled waste to stock');
-    updateDebug({ action: 'Stock recycled' });
     return;
   }
 
@@ -836,7 +865,6 @@ function drawFromStock() {
   renderBoard(false);
   const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
   console.log(`STOCK: Drew ${cardStr}`);
-  updateDebug({ action: `Drew ${cardStr}` });
 }
 
 // ----------------------------------------------------------------------------
@@ -851,7 +879,7 @@ function checkWinCondition() {
 }
 
 // ----------------------------------------------------------------------------
-// 16. MANUAL TOUCH & RAYCASTING PIPELINE
+// 16. MANUAL TOUCH & RAYCASTING PIPELINE (SINGLE MESH PER CARD)
 // ----------------------------------------------------------------------------
 const raycaster = new THREE.Raycaster();
 let isHandlingTap = false;
@@ -862,14 +890,14 @@ let tapStartTime = 0;
 function getInteractiveMeshes() {
   const meshes = [];
 
-  // 1. Pile slots: Stock always; others only when empty
+  // Active pile slots
   pileSlots.forEach((slotData) => {
     const mesh = slotData.el ? slotData.el.getObject3D('mesh') : null;
     if (!mesh) return;
 
     let isTargetable = false;
     if (slotData.type === 'stock') {
-      isTargetable = true;
+      isTargetable = true; // Always targetable to draw or recycle
     } else if (slotData.type === 'waste') {
       isTargetable = waste.length === 0;
     } else if (slotData.type === 'tableau') {
@@ -883,21 +911,15 @@ function getInteractiveMeshes() {
     }
   });
 
-  // 2. Interactive cards:
+  // Active cards: face-up cards + top card of stock
   deck.forEach((card) => {
     if (!card.el) return;
-    updateCardInteraction(card);
+    const mesh = card.el.getObject3D('mesh');
+    if (!mesh) return;
 
-    if (card.isInteractive) {
-      const hitMesh = card.hitEl ? card.hitEl.getObject3D('mesh') : null;
-      if (hitMesh) {
-        meshes.push(hitMesh);
-      } else {
-        const fallback = card.faceUp
-          ? (card.frontEl ? card.frontEl.getObject3D('mesh') : null)
-          : (card.backEl ? card.backEl.getObject3D('mesh') : null);
-        if (fallback) meshes.push(fallback);
-      }
+    const isStockTop = card.location && card.location.type === 'stock' && isTopOfPile(card, card.location);
+    if (card.faceUp || isStockTop) {
+      meshes.push(mesh);
     }
   });
 
@@ -937,44 +959,31 @@ function performRaycast(clientX, clientY) {
   });
 
   if (hits.length === 0) {
-    updateDebug({ hitType: 'MISS', card: 'NONE' });
+    updateDebug({ hitObject: 'NONE', card: 'NONE' });
     return;
   }
 
-  // Find the mapped Card or Slot from the closest hit
-  const hitObj = hits[0].object;
-  let card = null;
-  let slot = null;
-  let curr = hitObj;
+  // Sorted by distance: hits[0] is physically closest top-most card
+  const hitMesh = hits[0].object;
+  const card = meshToCard.get(hitMesh.uuid);
+  const slot = meshToSlot.get(hitMesh.uuid);
 
-  while (curr) {
-    if (meshToCard.has(curr.uuid)) {
-      card = meshToCard.get(curr.uuid);
-      break;
-    }
-    if (meshToSlot.has(curr.uuid)) {
-      slot = meshToSlot.get(curr.uuid);
-      break;
-    }
-    curr = curr.parent;
-  }
+  updateDebug({
+    hitObject: card ? `card-${card.id}` : slot ? `slot-${slot.type}` : hitMesh.uuid.slice(0, 8)
+  });
 
   if (card) {
     const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
     updateDebug({
-      hitType: 'CARD',
       card: `${cardStr} (${card.location ? card.location.type : '?'})`
     });
     onCardClicked(card);
   } else if (slot) {
     const slotStr = `${slot.type}${slot.index !== undefined ? '[' + slot.index + ']' : slot.suit ? '[' + slot.suit + ']' : ''}`;
     updateDebug({
-      hitType: 'SLOT',
       card: slotStr
     });
     handlePileClick(slot);
-  } else {
-    updateDebug({ hitType: 'UNMAPPED', card: 'NONE' });
   }
 }
 
@@ -1005,7 +1014,6 @@ function setupManualRaycasting() {
     const dt = performance.now() - tapStartTime;
     tapStartPos = null;
 
-    // Generous tap threshold for mobile screens
     if (dist > 28 || dt > 650) return;
 
     const now = performance.now();
@@ -1021,7 +1029,7 @@ function setupManualRaycasting() {
   }
 
   function onPointerDown(e) {
-    if (e.pointerType === 'touch') return; // Touch devices handled by onTouchStart
+    if (e.pointerType === 'touch') return;
     if (e.isPrimary === false) return;
     if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
       return;
@@ -1031,7 +1039,7 @@ function setupManualRaycasting() {
   }
 
   function onPointerUp(e) {
-    if (e.pointerType === 'touch') return; // Handled by onTouchEnd
+    if (e.pointerType === 'touch') return;
     if (e.isPrimary === false || !tapStartPos) return;
     if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
       tapStartPos = null;
@@ -1061,7 +1069,24 @@ function setupManualRaycasting() {
   window.addEventListener('pointerdown', onPointerDown, { passive: true });
   window.addEventListener('pointerup', onPointerUp, { passive: true });
 
-  // Handle MindAR tracking events
+  window.addEventListener('resize', () => {
+    const scene = document.querySelector('a-scene');
+    if (scene && scene.camera && scene.canvas) {
+      const rect = scene.canvas.getBoundingClientRect();
+      console.log(`RESIZE: Canvas is ${rect.width}x${rect.height}`);
+    }
+  });
+
+  window.addEventListener('orientationchange', () => {
+    setTimeout(() => {
+      const scene = document.querySelector('a-scene');
+      if (scene && scene.camera && scene.canvas) {
+        const rect = scene.canvas.getBoundingClientRect();
+        console.log(`ORIENTATION CHANGE: Canvas is ${rect.width}x${rect.height}`);
+      }
+    }, 200);
+  });
+
   const targetEl = document.querySelector('[mindar-image-target]');
   if (targetEl) {
     targetEl.addEventListener('targetFound', () => {
@@ -1083,17 +1108,16 @@ window.runSolitaireInteractionTests = function() {
   let passed = 0;
   const total = 7;
 
-  // Initialize fresh board
   dealNewGame();
 
-  // Test 1: Tap visible tableau card -> highlights
+  // Test 1: Tap visible tableau card
   const t1Card = tableau[0][0];
   onCardClicked(t1Card);
   const pass1 = selected && selected.card === t1Card;
   console.log(`[Test 1] Select visible tableau card (${t1Card.rank}${t1Card.suit}): ${pass1 ? 'PASS' : 'FAIL'}`);
   if (pass1) passed++;
 
-  // Test 2: Tap same card again -> deselects
+  // Test 2: Tap same card again -> cancels
   onCardClicked(t1Card);
   const pass2 = selected === null;
   console.log(`[Test 2] Cancel selection by tapping same card: ${pass2 ? 'PASS' : 'FAIL'}`);
@@ -1130,13 +1154,13 @@ window.runSolitaireInteractionTests = function() {
   const red10 = deck.find((c) => c.rank === '10' && c.color === 'red');
   tableau[3] = [red10]; red10.faceUp = true; red10.location = { type: 'tableau', index: 3 };
   onCardClicked(red10);
-  onCardClicked(red8); // Invalid
+  onCardClicked(red8);
   const pass6 = selected === null && tableau[3].includes(red10);
   console.log(`[Test 6] Invalid move rejection: ${pass6 ? 'PASS' : 'FAIL'}`);
   if (pass6) passed++;
 
   // Test 7: Empty tableau accepts King only
-  tableau[4] = []; // Empty
+  tableau[4] = [];
   const nonKing = deck.find((c) => c.rank === '5');
   tableau[5] = [nonKing]; nonKing.faceUp = true; nonKing.location = { type: 'tableau', index: 5 };
   onCardClicked(nonKing);
@@ -1154,22 +1178,14 @@ window.runSolitaireInteractionTests = function() {
   if (pass7) passed++;
 
   console.log(`=== TEST SUMMARY: ${passed}/${total} PASSED ===`);
-  dealNewGame(); // Restore board
+  dealNewGame();
   return passed === total;
 };
 
 // ----------------------------------------------------------------------------
 // 18. BOOTSTRAP
 // ----------------------------------------------------------------------------
-function applyBoardScale() {
-  const board = document.getElementById('gameBoard');
-  if (board) {
-    board.setAttribute('scale', `${BOARD_SCALE} ${BOARD_SCALE} ${BOARD_SCALE}`);
-  }
-}
-
 function init() {
-  applyBoardScale();
   createPileSlots();
   setupManualRaycasting();
   const newGameBtn = document.getElementById('newGameBtn');

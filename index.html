@@ -156,7 +156,7 @@
              All game geometry lives inside this entity so it inherits the
              marker's tracked transform automatically. -->
         <a-entity mindar-image-target="targetIndex: 0">
-            <a-entity id="gameBoard" scale="0.72 0.72 0.72">
+            <a-entity id="gameBoard">
                 <!-- Empty-pile click targets (stock/waste/foundations/tableau),
                      created once by createPileSlots() in game.js. -->
                 <a-entity id="slotsContainer"></a-entity>
@@ -168,21 +168,18 @@
         </a-entity>
     </a-scene>
 
-    <!-- NOTE: model.glb from the original prototype is no longer loaded —
-         cards are now built as textured planes at runtime (see game.js,
-         section 4). If you'd rather render true 3D card meshes instead of
-         flat planes, you can still register model.glb in an <a-assets>
-         block and swap it in inside createCardEntity(). -->
-
     <div id="debugPanel" style="display: none;">
         <div>AR: <span id="debugTracking" class="status-searching">SEARCHING</span></div>
-        <div>Pointer: <span id="debugPointer" class="highlight-val">-</span></div>
+        <div>CARD MESHES: <span id="debugCardMeshes" class="highlight-val">52</span></div>
+        <div>VISIBLE MESHES: <span id="debugVisibleMeshes" class="highlight-val">0</span></div>
+        <div>TEXTURES READY: <span id="debugTexturesReady" class="highlight-val">0/53</span></div>
+        <div>POINTER: <span id="debugPointer" class="highlight-val">-</span></div>
         <div>NDC: <span id="debugNDC">-</span></div>
-        <div>Hits: <span id="debugHits" class="highlight-val">0</span></div>
-        <div>Hit type: <span id="debugHitType">-</span></div>
-        <div>Card: <span id="debugCard" class="highlight-val">NONE</span></div>
-        <div>Selected: <span id="debugSelected">NO</span></div>
-        <div>Action: <span id="debugAction" class="highlight-val">READY</span></div>
+        <div>HITS: <span id="debugHits" class="highlight-val">0</span></div>
+        <div>HIT OBJECT: <span id="debugHitObject">-</span></div>
+        <div>CARD: <span id="debugCard" class="highlight-val">NONE</span></div>
+        <div>SELECTED: <span id="debugSelected">NO</span></div>
+        <div>BOARD: <span id="debugBoard" class="highlight-val">-</span></div>
     </div>
 
     <div class="overlay">
