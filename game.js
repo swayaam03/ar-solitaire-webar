@@ -60,6 +60,8 @@ const CONFIG = {
 // ----------------------------------------------------------------------------
 // 1. CONSTANTS — suits, ranks, and the 3D table layout
 // ----------------------------------------------------------------------------
+const BOARD_SCALE = 0.72; // Global scale applied to #gameBoard
+
 const SUITS = ['hearts', 'diamonds', 'clubs', 'spades'];
 const SUIT_SYMBOLS = { hearts: '\u2665', diamonds: '\u2666', clubs: '\u2663', spades: '\u2660' };
 const SUIT_COLORS = { hearts: 'red', diamonds: 'red', clubs: 'black', spades: 'black' };
@@ -67,40 +69,33 @@ const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
 const RANK_VALUES = RANKS.reduce((map, r, i) => { map[r] = i + 1; return map; }, {});
 
 // Card footprint, in target-local units. A standard poker card is ~2.5:3.5.
-const CARD_WIDTH = 0.13;
-const CARD_HEIGHT = 0.182;
+const CARD_WIDTH = 0.11;
+const CARD_HEIGHT = 0.154;
 
 // Horizontal spacing between the 7 tableau columns / top-row piles.
-const COL_GAP = 0.16;
+const COL_GAP = 0.115;
 const TABLEAU_X = [-3, -2, -1, 0, 1, 2, 3].map((n) => n * COL_GAP);
 
 // Vertical cascade: how far down (in Y) each successive tableau card sits.
-// Face-down cards show only a sliver; face-up cards show enough to read.
+// Face-down cards show only a sliver; face-up cards show enough to read rank/suit.
 const TABLEAU_TOP_Y = -0.02;
 const TABLEAU_FACEDOWN_STEP = 0.018;
-const TABLEAU_FACEUP_STEP = 0.045;
+const TABLEAU_FACEUP_STEP = 0.040;
 
 // Top row: Stock | Waste | (gap) | Foundation x4
-const TOP_ROW_Y = 0.30;
+const TOP_ROW_Y = 0.28;
 const STOCK_POS = { x: TABLEAU_X[0], y: TOP_ROW_Y };
 const WASTE_POS = { x: TABLEAU_X[1], y: TOP_ROW_Y };
 const FOUNDATION_X = [TABLEAU_X[3], TABLEAU_X[4], TABLEAU_X[5], TABLEAU_X[6]];
 const FOUNDATION_Y = TOP_ROW_Y;
 
-// Z-depth given to each card within a pile, so the top card of any pile is
-// always physically closest to the camera (and therefore the one the
-// raycaster hits first). Kept larger than the front/back plane offset below
-// so neighbouring cards' planes never interleave in depth. These are large
-// enough to survive typical AR-camera depth-buffer precision at a marker's
-// viewing distance; on top of this we also apply an explicit polygonOffset
-// per layer (see applyDepthBias) so stacking order never relies solely on
-// floating-point geometry, which is what caused stacked cards to flicker/
-// bleed into each other on-device.
-const CARD_Z_STEP = 0.012;
-const PLANE_Z_OFFSET = 0.003; // front plane at +this, back plane at -this
+// Stable Z-depth ordering
+const CARD_Z_STEP = 0.006;
+const PLANE_Z_OFFSET = 0.0015; // front plane at +this, back plane at -this
 
-// How far (in Y) a selected card/run lifts up to show it's selected.
-const SELECT_LIFT = 0.025;
+// How far (in Y and Z) a selected card/run lifts up to show it's selected.
+const SELECT_LIFT_Y = 0.012;
+const SELECT_LIFT_Z = 0.020;
 
 // ----------------------------------------------------------------------------
 // 2. GAME STATE
@@ -203,25 +198,25 @@ function createCardEntity(card) {
   wrapper.classList.add('card-wrapper');
   wrapper.dataset.cardId = card.id;
 
-  // --- Front plane: shows rank/suit, faces +Z when wrapper rotation = 0 ---
+  // --- Front plane: shows rank/suit, visible when faceUp ---
   const front = document.createElement('a-plane');
   front.classList.add('clickable', 'card-front');
   front.setAttribute('width', CARD_WIDTH);
   front.setAttribute('height', CARD_HEIGHT);
   front.setAttribute('position', `0 0 ${PLANE_Z_OFFSET}`);
+  front.setAttribute('visible', card.faceUp);
   // shader:flat = MeshBasicMaterial -> texture colors render true regardless
   // of the scene's AR lighting, which is what you want for readable cards.
   front.setAttribute('material', 'shader: flat; side: front');
 
-  // --- Back plane: pre-rotated 180° so it faces -Z when wrapper rotation = 0
-  //     (i.e. hidden). When the wrapper flips to 180°, this plane's world
-  //     rotation becomes 0° and IT is the one facing the camera. ---
+  // --- Back plane: pre-rotated 180°, visible when !faceUp ---
   const back = document.createElement('a-plane');
   back.classList.add('clickable', 'card-back');
   back.setAttribute('width', CARD_WIDTH);
   back.setAttribute('height', CARD_HEIGHT);
   back.setAttribute('rotation', '0 180 0');
   back.setAttribute('position', `0 0 ${-PLANE_Z_OFFSET}`);
+  back.setAttribute('visible', !card.faceUp);
   back.setAttribute('material', 'shader: flat; side: front; color: #8B0000');
 
   wrapper.appendChild(front);
@@ -231,7 +226,7 @@ function createCardEntity(card) {
   front.addEventListener('loaded', () => applyTexture(front, getFrontTexture(card)));
   back.addEventListener('loaded', () => applyTexture(back, getBackTexture()));
 
-  // Click handling: both faces of a card resolve to the same game logic.
+  // Click handling fallback (manual raycasting handles primary interaction)
   front.addEventListener('click', () => onCardClicked(card));
   back.addEventListener('click', () => onCardClicked(card));
 
@@ -241,17 +236,14 @@ function createCardEntity(card) {
   return wrapper;
 }
 
-// Uploads a THREE texture onto an <a-plane>'s mesh material. Retries if the
-// mesh isn't ready yet (loaded fires when the entity is attached, but the
-// mesh material is created synchronously by the material component so in
-// practice one attempt is almost always enough — the retry is just a safety
-// net for slow devices).
+// Uploads a THREE texture onto an <a-plane>'s mesh material.
 function applyTexture(planeEl, texture) {
   const mesh = planeEl.getObject3D('mesh');
   if (mesh && mesh.material) {
     mesh.material.map = texture;
     mesh.material.color.set(0xffffff);
-    mesh.material.polygonOffset = true; // baseline; per-layer value set by applyDepthBias
+    mesh.material.depthTest = true;
+    mesh.material.depthWrite = true;
     mesh.material.needsUpdate = true;
   } else {
     setTimeout(() => applyTexture(planeEl, texture), 50);
@@ -263,9 +255,10 @@ function applyTexture(planeEl, texture) {
 // multiplying the texture with a colour instead.
 function setHighlight(card, on) {
   [card.frontEl, card.backEl].forEach((el) => {
+    if (!el) return;
     const mesh = el.getObject3D('mesh');
     if (mesh && mesh.material) {
-      mesh.material.color.set(on ? 0xffe066 : 0xffffff);
+      mesh.material.color.set(on ? 0xffea75 : 0xffffff);
       mesh.material.needsUpdate = true;
     }
   });
@@ -418,20 +411,28 @@ function roundRect(ctx, x, y, w, h, r, fill, stroke) {
 // it along the ray and is hit first instead — exactly what we want.
 function createPileSlots() {
   const container = document.getElementById('slotsContainer');
+  if (!container) return;
+  while (container.firstChild) container.removeChild(container.firstChild);
+
   addSlot(container, 'stock', null, STOCK_POS.x, STOCK_POS.y);
   addSlot(container, 'waste', null, WASTE_POS.x, WASTE_POS.y);
   SUITS.forEach((suit, i) => addSlot(container, 'foundation', suit, FOUNDATION_X[i], FOUNDATION_Y));
   for (let c = 0; c < 7; c++) addSlot(container, 'tableau', c, TABLEAU_X[c], TABLEAU_TOP_Y);
 }
 
-function addSlot(container, type, index, x, y) {
+function addSlot(container, type, id, x, y) {
   const el = document.createElement('a-plane');
   el.classList.add('clickable', 'pile-slot');
+  el.dataset.pileType = type;
+  if (id !== null && id !== undefined) {
+    el.dataset.pileId = id;
+  }
   el.setAttribute('width', CARD_WIDTH);
   el.setAttribute('height', CARD_HEIGHT);
-  el.setAttribute('position', `${x} ${y} -0.01`);
-  el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.10; transparent: true');
-  el.addEventListener('click', () => handlePileClick({ type, index }));
+  el.setAttribute('position', `${x} ${y} -0.005`);
+  el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.15; transparent: true');
+  const pile = type === 'foundation' ? { type: 'foundation', suit: id, index: id } : { type, index: id };
+  el.addEventListener('click', () => handlePileClick(pile));
   container.appendChild(el);
 }
 
@@ -457,7 +458,7 @@ function renderBoard(instant) {
   // Fan the last few waste cards slightly so recent draws are visible.
   waste.forEach((card, i) => {
     const fromTop = waste.length - 1 - i;
-    const fan = fromTop < 3 ? (2 - fromTop) * 0.018 : 0;
+    const fan = fromTop < 3 ? (2 - fromTop) * 0.016 : 0;
     setCardTransform(card, { x: WASTE_POS.x + fan, y: WASTE_POS.y, z: i * CARD_Z_STEP }, true, instant);
   });
 
@@ -473,19 +474,18 @@ function renderBoard(instant) {
   }
 }
 
-// Biases the depth-test result for a card's two faces so pile stacking
-// order is resolved deterministically by the GPU, instead of relying only
-// on the (very small) real Z gaps between cards. `layer` is the card's
-// index within its pile (0 = bottom). Without this, stacked cards can
-// z-fight and flicker/bleed into each other, especially at the oblique
-// viewing angles typical of handheld AR.
+// Ensures proper depth testing and mild baseline polygon offset so the stable
+// geometric Z gaps (CARD_Z_STEP = 0.006) strictly govern depth ordering.
 function applyDepthBias(card, layer) {
   [card.frontEl, card.backEl].forEach((el) => {
+    if (!el) return;
     const mesh = el.getObject3D('mesh');
     if (mesh && mesh.material) {
+      mesh.material.depthTest = true;
+      mesh.material.depthWrite = true;
       mesh.material.polygonOffset = true;
-      mesh.material.polygonOffsetFactor = -layer;
-      mesh.material.polygonOffsetUnits = -layer * 4;
+      mesh.material.polygonOffsetFactor = -0.5;
+      mesh.material.polygonOffsetUnits = -1;
     }
   });
 }
@@ -495,17 +495,26 @@ function setCardTransform(card, pos, faceUp, instant) {
   if (!el) return;
   const targetRotation = faceUp ? '0 0 0' : '0 180 0';
 
-  applyDepthBias(card, Math.round(pos.z / CARD_Z_STEP));
-
   if (instant) {
+    if (card.frontEl) card.frontEl.setAttribute('visible', faceUp);
+    if (card.backEl) card.backEl.setAttribute('visible', !faceUp);
+    applyDepthBias(card, Math.round(pos.z / CARD_Z_STEP));
     el.removeAttribute('animation__move');
     el.removeAttribute('animation__flip');
     el.removeAttribute('animation__lift');
     el.setAttribute('position', `${pos.x} ${pos.y} ${pos.z}`);
     el.setAttribute('rotation', targetRotation);
   } else {
+    // Keep both visible during 3D flip animation for visual smoothness, then hide the occluded face
+    if (card.frontEl) card.frontEl.setAttribute('visible', true);
+    if (card.backEl) card.backEl.setAttribute('visible', true);
+    applyDepthBias(card, Math.round(pos.z / CARD_Z_STEP));
     el.setAttribute('animation__move', `property: position; to: ${pos.x} ${pos.y} ${pos.z}; dur: 350; easing: easeOutQuad`);
     el.setAttribute('animation__flip', `property: rotation; to: ${targetRotation}; dur: 300; easing: easeInOutQuad`);
+    setTimeout(() => {
+      if (card.frontEl) card.frontEl.setAttribute('visible', card.faceUp);
+      if (card.backEl) card.backEl.setAttribute('visible', !card.faceUp);
+    }, 320);
   }
 }
 
@@ -514,7 +523,7 @@ function setCardTransform(card, pos, faceUp, instant) {
 // ----------------------------------------------------------------------------
 function getPileArray(pile) {
   if (pile.type === 'tableau') return tableau[pile.index];
-  if (pile.type === 'foundation') return foundations[pile.index];
+  if (pile.type === 'foundation') return foundations[pile.suit || pile.index];
   if (pile.type === 'waste') return waste;
   if (pile.type === 'stock') return stock;
   return [];
@@ -563,7 +572,7 @@ function canPlaceOnTableau(card, destCol) {
 function canPlaceOnFoundation(card, suit) {
   if (card.suit !== suit) return false;
   const arr = foundations[suit];
-  if (arr.length === 0) return card.rank === 'A';
+  if (!arr || arr.length === 0) return card.rank === 'A';
   const top = arr[arr.length - 1];
   return top.rankValue === card.rankValue - 1;
 }
@@ -577,8 +586,12 @@ function selectCard(card, pile) {
   run.forEach((c) => {
     const el = c.el;
     const pos = el.getAttribute('position');
+    el.dataset.origX = pos.x;
     el.dataset.origY = pos.y;
-    el.setAttribute('animation__lift', `property: position.y; to: ${pos.y + SELECT_LIFT}; dur: 150; easing: easeOutQuad`);
+    el.dataset.origZ = pos.z;
+    const targetY = (parseFloat(pos.y) + SELECT_LIFT_Y).toFixed(4);
+    const targetZ = (parseFloat(pos.z) + SELECT_LIFT_Z).toFixed(4);
+    el.setAttribute('animation__lift', `property: position; to: ${pos.x} ${targetY} ${targetZ}; dur: 150; easing: easeOutQuad`);
     setHighlight(c, true);
   });
 }
@@ -588,8 +601,15 @@ function deselectCard() {
   if (!selected) return;
   selected.run.forEach((c) => {
     const el = c.el;
-    const origY = parseFloat(el.dataset.origY);
-    el.setAttribute('animation__lift', `property: position.y; to: ${origY}; dur: 150; easing: easeOutQuad`);
+    const origX = el.dataset.origX;
+    const origY = el.dataset.origY;
+    const origZ = el.dataset.origZ;
+    if (origY !== undefined && origZ !== undefined) {
+      el.setAttribute('animation__lift', `property: position; to: ${origX} ${origY} ${origZ}; dur: 150; easing: easeOutQuad`);
+      setTimeout(() => {
+        el.removeAttribute('animation__lift');
+      }, 160);
+    }
     setHighlight(c, false);
   });
   selected = null;
@@ -619,8 +639,10 @@ function onCardClicked(card) {
     return;
   }
 
+  // Face-down cards in tableau cannot be selected or targeted
+  if (!card.faceUp) return;
+
   if (!selected) {
-    if (!card.faceUp) return; // can't pick up a face-down card
     if (pile.type === 'foundation' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'waste' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'tableau' && !isValidRunFrom(pile.index, card)) return;
@@ -651,14 +673,25 @@ function handlePileClick(pile) {
 function attemptMove(sel, destPile) {
   const { run, pile: srcPile } = sel;
 
+  const destSuit = destPile.suit || destPile.index;
+  const srcSuit = srcPile.suit || srcPile.index;
+
+  const isSamePile = destPile.type === srcPile.type && (
+    destPile.type === 'foundation'
+      ? destSuit === srcSuit
+      : destPile.type === 'tableau'
+      ? String(destPile.index) === String(srcPile.index)
+      : true
+  );
+
   // Tapping back into the pile the run already belongs to = cancel.
-  if (destPile.type === srcPile.type && String(destPile.index) === String(srcPile.index)) {
+  if (isSamePile) {
     deselectCard();
     return;
   }
 
   let valid = false;
-  if (destPile.type === 'foundation' && run.length === 1 && canPlaceOnFoundation(run[0], destPile.index)) {
+  if (destPile.type === 'foundation' && run.length === 1 && canPlaceOnFoundation(run[0], destSuit)) {
     valid = true;
   } else if (destPile.type === 'tableau' && canPlaceOnTableau(run[0], destPile.index)) {
     valid = true;
@@ -683,8 +716,11 @@ function moveCardsToPile(run, srcPile, destPile) {
   });
 
   const destArr = getPileArray(destPile);
+  const destSuit = destPile.suit || destPile.index;
   run.forEach((c) => {
-    c.location = { type: destPile.type, index: destPile.index };
+    c.location = destPile.type === 'foundation'
+      ? { type: 'foundation', suit: destSuit, index: destSuit }
+      : { type: destPile.type, index: destPile.index };
     destArr.push(c);
   });
 
@@ -743,54 +779,173 @@ function checkWinCondition() {
 }
 
 // ----------------------------------------------------------------------------
-// 15. MANUAL TAP DETECTION
+// 15. MANUAL TAP DETECTION & RAYCASTING
 // ----------------------------------------------------------------------------
 // We deliberately don't use A-Frame's built-in cursor/raycaster components
-// (see the comment on <a-camera> in index.html) because they depend on the
-// browser synthesizing a "click" after a touch, which MindAR's own touch
-// handling often eats on mobile. Instead we raycast by hand on "pointerup",
-// a single low-level event that covers touch, mouse, and pen uniformly and
-// isn't affected by that suppression. Whichever mesh is hit gets a normal
-// A-Frame "click" event emitted on it, so all the existing
-// addEventListener('click', ...) handlers on cards and pile slots work
-// completely unchanged.
+// because they depend on synthetic browser click events which MindAR touch
+// handling can suppress or distort on mobile devices.
+//
+// Instead, we manually raycast on pointerdown/pointerup, distinguishing clean
+// taps from drags/swipes. Only visible, interactive card faces and valid pile
+// slots are candidate meshes, preventing hidden faces or dormant tableau cards
+// from intercepting raycasts or stealing clicks.
+
+function getInteractiveTargets() {
+  const targets = [];
+
+  // 1. Pile slots:
+  // Stock slot is always interactive (allows drawing or recycling waste when stock is empty).
+  // Waste, tableau, and foundation slots are interactive only when empty!
+  const slots = document.querySelectorAll('.pile-slot');
+  slots.forEach((slotEl) => {
+    const mesh = slotEl.getObject3D('mesh');
+    if (!mesh) return;
+
+    const slotType = slotEl.dataset.pileType;
+    const slotId = slotEl.dataset.pileId;
+    let isTargetable = false;
+
+    if (slotType === 'stock') {
+      isTargetable = true;
+    } else if (slotType === 'waste') {
+      isTargetable = waste.length === 0;
+    } else if (slotType === 'tableau') {
+      const col = parseInt(slotId, 10);
+      isTargetable = tableau[col] && tableau[col].length === 0;
+    } else if (slotType === 'foundation') {
+      isTargetable = foundations[slotId] && foundations[slotId].length === 0;
+    }
+
+    if (isTargetable) {
+      const pile = slotType === 'foundation'
+        ? { type: 'foundation', suit: slotId, index: slotId }
+        : { type: slotType, index: slotId };
+      targets.push({ mesh, el: slotEl, pile });
+    }
+  });
+
+  // 2. Interactive cards:
+  // Face-up cards: frontEl mesh is active and visible.
+  // Face-down cards: only stock cards are interactive (tapping stock draws).
+  // Face-down tableau cards are not interactive, so they never steal raycast hits.
+  deck.forEach((card) => {
+    if (!card.el) return;
+
+    if (card.faceUp && card.frontEl) {
+      const mesh = card.frontEl.getObject3D('mesh');
+      if (mesh && card.frontEl.getAttribute('visible') !== false) {
+        targets.push({ mesh, el: card.frontEl, card });
+      }
+    } else if (!card.faceUp && card.backEl) {
+      if (card.location && card.location.type === 'stock') {
+        const mesh = card.backEl.getObject3D('mesh');
+        if (mesh && card.backEl.getAttribute('visible') !== false) {
+          targets.push({ mesh, el: card.backEl, card });
+        }
+      }
+    }
+  });
+
+  return targets;
+}
+
 function setupManualRaycasting() {
   const scene = document.querySelector('a-scene');
-  const canvas = scene.canvas;
-  if (!canvas) return;
-
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
 
-  canvas.addEventListener('pointerup', (event) => {
-    const camera = scene.camera;
+  let pointerDownPos = null;
+  let pointerDownTime = 0;
+  let lastTapTime = 0;
+
+  function onPointerDown(e) {
+    if (e.isPrimary === false) return;
+    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+      return;
+    }
+    pointerDownPos = { x: e.clientX, y: e.clientY };
+    pointerDownTime = performance.now();
+  }
+
+  function onPointerUp(e) {
+    if (e.isPrimary === false || !pointerDownPos) return;
+
+    const startX = pointerDownPos.x;
+    const startY = pointerDownPos.y;
+    pointerDownPos = null;
+
+    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+      return;
+    }
+
+    const now = performance.now();
+    if (now - lastTapTime < 80) return; // Debounce rapid / double events
+
+    const dist = Math.hypot(e.clientX - startX, e.clientY - startY);
+    const dt = now - pointerDownTime;
+    if (dist > 15 || dt > 700) return; // Reject drags, swipes, or long presses
+    lastTapTime = now;
+
+    const camera = scene ? scene.camera : null;
     if (!camera) return;
 
+    const canvas = scene ? scene.canvas : null;
+    if (!canvas) return;
+
     const rect = canvas.getBoundingClientRect();
-    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    if (
+      e.clientX < rect.left || e.clientX > rect.right ||
+      e.clientY < rect.top || e.clientY > rect.bottom
+    ) {
+      return;
+    }
+
+    pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(pointer, camera);
 
-    const meshes = Array.from(document.querySelectorAll('.clickable'))
-      .map((el) => el.getObject3D('mesh'))
-      .filter(Boolean);
+    const interactiveTargets = getInteractiveTargets();
+    if (interactiveTargets.length === 0) return;
 
+    const meshes = interactiveTargets.map((t) => t.mesh);
     const hits = raycaster.intersectObjects(meshes, false);
+
     if (hits.length > 0) {
-      const hitEl = hits[0].object.el; // A-Frame back-reference to the entity
-      if (hitEl) hitEl.emit('click', {}, false);
+      const hitMesh = hits[0].object;
+      const target = interactiveTargets.find((t) => t.mesh === hitMesh);
+      if (target) {
+        if (target.card) {
+          onCardClicked(target.card);
+        } else if (target.pile) {
+          handlePileClick(target.pile);
+        } else if (target.el) {
+          target.el.emit('click', {}, false);
+        }
+      }
     }
-  });
+  }
+
+  window.addEventListener('pointerdown', onPointerDown, { passive: true });
+  window.addEventListener('pointerup', onPointerUp, { passive: true });
 }
 
 // ----------------------------------------------------------------------------
 // 16. BOOTSTRAP
 // ----------------------------------------------------------------------------
+function applyBoardScale() {
+  const board = document.getElementById('gameBoard');
+  if (board) {
+    board.setAttribute('scale', `${BOARD_SCALE} ${BOARD_SCALE} ${BOARD_SCALE}`);
+  }
+}
+
 function init() {
+  applyBoardScale();
   createPileSlots();
   setupManualRaycasting();
   const newGameBtn = document.getElementById('newGameBtn');
   if (newGameBtn) newGameBtn.addEventListener('click', dealNewGame);
+  window.dealNewGame = dealNewGame;
   dealNewGame();
 }
 
